@@ -1,0 +1,25 @@
+name = "dark-valley-api-v4"
+main = "worker.js"
+compatibility_date = "2026-11-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "dark-valley-db"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+
+[[r2_buckets]]
+binding = "AUDIO"
+bucket_name = "dark-valley-audio"
+
+[[durable_objects.bindings]]
+name = "ROOMS"
+class_name = "Room"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Room"]
+
+[vars]
+ALLOWED_ORIGINS = "https://YOUR-DARK-VALLEY-DOMAIN.example"
+# IMPORTANT: for login cookies set a concrete HTTPS origin (not *). Multiple: comma-separated.
+USER_UPLOAD_QUOTA_MB = "100"
