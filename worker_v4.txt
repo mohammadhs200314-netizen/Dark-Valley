@@ -1,0 +1,362 @@
+// Dark Valley Worker V4 - hardened foundation
+// Based on the supplied V3 backend. See README_DARK_VALLEY_V4_FA.md for implemented scope and setup.
+// D1 binding: DB | R2 binding: AUDIO | Durable Object binding: ROOMS
+// Secrets: ADMIN_SETUP_TOKEN (one-time owner bootstrap token)
+// Vars: ALLOWED_ORIGINS, USER_UPLOAD_QUOTA_MB
+const enc = new TextEncoder();
+const id = () => crypto.randomUUID();
+const hex = b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, "0")).join("");
+async function hash(s) { return hex(await crypto.subtle.digest("SHA-256", enc.encode(s))); }
+async function passHash(password, salt) {
+  const key = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]);
+  return hex(await crypto.subtle.deriveBits({ name: "PBKDF2", salt: enc.encode(salt), iterations: 180000, hash: "SHA-256" }, key, 256));
+}
+function cookie(name, value, maxAge) { return `${name}=${value}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${maxAge}`; }
+function getCookie(req, name) {
+  return (req.headers.get("Cookie") || "").split(";").map(x => x.trim()).find(x => x.startsWith(name + "="))?.slice(name.length + 1);
+}
+function corsHeaders(req, env) {
+  const origin = req.headers.get("Origin");
+  const allowed = String(env.ALLOWED_ORIGINS || "").split(",").map(x => x.trim()).filter(Boolean);
+  const sameOrigin = origin && origin === new URL(req.url).origin;
+  const ok = !origin || sameOrigin || allowed.includes(origin);
+  const h = new Headers({
+    "Vary": "Origin",
+    "Access-Control-Allow-Credentials": "true",
+    "Access-Control-Allow-Headers": "Content-Type, Range",
+    "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges",
+    "Access-Control-Allow-Methods": "GET,POST,DELETE,OPTIONS",
+    "Access-Control-Max-Age": "86400",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "X-Frame-Options": "DENY",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()"
+  });
+  if (origin && ok) h.set("Access-Control-Allow-Origin", origin);
+  return { headers: h, ok };
+}
+const json = (data, status = 200, headers = new Headers()) => {
+  const h = new Headers(headers); h.set("Content-Type", "application/json; charset=utf-8");
+  return new Response(JSON.stringify(data), { status, headers: h });
+};
+async function body(req) { try { return await req.json(); } catch { return {}; } }
+async function auth(req, env) {
+  const token = getCookie(req, "dv_session"); if (!token) return null;
+  const tokenHash = await hash(token);
+  return await env.DB.prepare(
+    "SELECT u.id,u.name,u.email,u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>?"
+  ).bind(tokenHash, Date.now()).first();
+}
+const isAdmin = u => !!u && u.role === "admin";
+async function makeSession(uid, env, headers) {
+  const token = hex(crypto.getRandomValues(new Uint8Array(32)));
+  await env.DB.prepare("INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)")
+    .bind(await hash(token), uid, Date.now() + 30 * 86400000).run();
+  const user = await env.DB.prepare("SELECT id,name,email,role FROM users WHERE id=?").bind(uid).first();
+  const h = new Headers(headers); h.append("Set-Cookie", cookie("dv_session", token, 30 * 86400));
+  return json({ user }, 200, h);
+}
+function quotaBytes(env) {
+  const mb = Math.max(10, Math.min(2048, Number(env.USER_UPLOAD_QUOTA_MB || 100)));
+  return Math.floor(mb * 1024 * 1024);
+}
+function bytesAllowed(file, max, label) {
+  if (!(file instanceof File) || file.size <= 0) throw new Error(`فایل ${label} انتخاب نشده است`);
+  if (file.size > max) throw new Error(`حجم ${label} از حد مجاز بیشتر است`);
+}
+const audioExt = /\.(mp3|m4a|aac|ogg|wav|flac|webm)$/i;
+const imageTypes = new Set(["image/jpeg", "image/png", "image/webp"]);
+// Best-effort isolate-local limiter. Configure Cloudflare Rate Limiting/WAF for global enforcement.
+const loginAttempts = new Map();
+function loginLimited(key) {
+  const now = Date.now(), old = loginAttempts.get(key);
+  if (!old || now - old.startedAt > 10 * 60 * 1000) { loginAttempts.set(key, { startedAt: now, count: 1 }); return false; }
+  old.count++; return old.count > 10;
+}
+async function userQuota(env, userId) {
+  const used = await env.DB.prepare(
+    "SELECT COALESCE(SUM(storage_bytes),0) AS used FROM submissions WHERE user_id=? AND status IN ('pending','approved')"
+  ).bind(userId).first();
+  const recent = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM submissions WHERE user_id=? AND submitted_at>?"
+  ).bind(userId, Date.now() - 86400000).first();
+  const limit = quotaBytes(env), usedBytes = Number(used?.used || 0);
+  return { usedBytes, quotaBytes: limit, remainingBytes: Math.max(0, limit - usedBytes), remainingUploads: Math.max(0, 2 - Number(recent?.n || 0)) };
+}
+async function removeSubmissionObjects(env, row) {
+  if (row?.audio_key) await env.AUDIO.delete(row.audio_key);
+  if (row?.cover_key) await env.AUDIO.delete(row.cover_key);
+}
+export default {
+  async fetch(req, env) {
+    const url = new URL(req.url), p = url.pathname, method = req.method;
+    const cors = corsHeaders(req, env), headers = cors.headers;
+    if (!cors.ok) return json({ error: "Origin مجاز نیست" }, 403, headers);
+    if (method === "OPTIONS") return new Response(null, { status: 204, headers });
+    try {
+      if (p === "/api/health" && method === "GET") return json({ ok: true, service: "Dark Valley API", version: "4.0.0", timestamp: Date.now() }, 200, headers);
+      if (p === "/api/register" && method === "POST") {
+        const b = await body(req), name = String(b.name || "").trim(), email = String(b.email || "").trim().toLowerCase(), password = String(b.password || "");
+        if (name.length < 2 || !email.includes("@") || password.length < 10) return json({ error: "نام، ایمیل معتبر و رمز حداقل ۱۰ نویسه لازم است" }, 400, headers);
+        let role = "user";
+        if (b.adminSetupToken) {
+          if (!env.ADMIN_SETUP_TOKEN || b.adminSetupToken !== env.ADMIN_SETUP_TOKEN) return json({ error: "کد راه‌اندازی مدیر معتبر نیست" }, 403, headers);
+          const existingAdmin = await env.DB.prepare("SELECT id FROM users WHERE role='admin' LIMIT 1").first();
+          if (existingAdmin) return json({ error: "حساب مدیر قبلاً ساخته شده است" }, 409, headers);
+          role = "admin";
+        }
+        const uid = id(), salt = id(), ph = await passHash(password, salt);
+        try {
+          await env.DB.prepare("INSERT INTO users(id,name,email,salt,password_hash,role,created_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(uid, name, email, salt, ph, role, Date.now()).run();
+        } catch { return json({ error: "این ایمیل قبلاً ثبت شده است" }, 409, headers); }
+        return await makeSession(uid, env, headers);
+      }
+      if (p === "/api/login" && method === "POST") {
+        const b = await body(req), email = String(b.email || "").trim().toLowerCase();
+        const ip = req.headers.get("CF-Connecting-IP") || "unknown";
+        if (loginLimited(`${ip}:${email}`)) return json({ error: "تلاش‌های ورود بیش از حد مجاز است؛ ۱۰ دقیقه بعد دوباره امتحان کن" }, 429, headers);
+        const u = await env.DB.prepare("SELECT * FROM users WHERE email=?").bind(email).first();
+        if (!u || await passHash(String(b.password || ""), u.salt) !== u.password_hash) return json({ error: "ایمیل یا رمز عبور اشتباه است" }, 401, headers);
+        return await makeSession(u.id, env, headers);
+      }
+      if (p === "/api/logout" && method === "POST") {
+        const t = getCookie(req, "dv_session");
+        if (t) await env.DB.prepare("DELETE FROM sessions WHERE token_hash=?").bind(await hash(t)).run();
+        const h = new Headers(headers); h.append("Set-Cookie", cookie("dv_session", "", 0));
+        return json({ ok: true }, 200, h);
+      }
+
+      const u = await auth(req, env);
+      if (p === "/api/me" && method === "GET") return json({ user: u || null }, 200, headers);
+
+      if (p === "/api/songs" && method === "GET") {
+        const limit = Math.max(1, Math.min(100, Number(url.searchParams.get("limit") || 50)));
+        const offset = Math.max(0, Number(url.searchParams.get("offset") || 0));
+        const { results } = await env.DB.prepare("SELECT id,title,artist,genre,description,cover_key,created_at FROM songs WHERE published=1 ORDER BY created_at DESC LIMIT ? OFFSET ?").bind(limit, offset).all();
+        return json({ songs: results.map(s => ({ ...s, coverUrl: s.cover_key ? `${url.origin}/api/cover/${encodeURIComponent(s.id)}` : null })), pagination: { limit, offset, hasMore: results.length === limit } }, 200, headers);
+      }
+      if (p === "/api/stream-url" && method === "GET") {
+        const sid = url.searchParams.get("id"), s = await env.DB.prepare("SELECT id FROM songs WHERE id=? AND published=1").bind(sid).first();
+        if (!s) return json({ error: "آهنگ پیدا نشد" }, 404, headers);
+        return json({ url: `${url.origin}/api/stream/${encodeURIComponent(sid)}` }, 200, headers);
+      }
+      if (p.startsWith("/api/stream/") && method === "GET") {
+        const sid = decodeURIComponent(p.split("/").pop());
+        const s = await env.DB.prepare("SELECT audio_key,mime_type FROM songs WHERE id=? AND published=1").bind(sid).first();
+        if (!s) return new Response("Not found", { status: 404, headers });
+        const meta = await env.AUDIO.head(s.audio_key); if (!meta) return new Response("Not found", { status: 404, headers });
+        const range = req.headers.get("Range"); let obj, status = 200;
+        const h = new Headers(headers); h.set("Content-Type", s.mime_type || "audio/mpeg"); h.set("Accept-Ranges", "bytes");
+        h.set("Cache-Control", "private, no-store"); h.set("Content-Disposition", "inline");
+        if (range) {
+          const m = range.match(/bytes=(\d*)-(\d*)/);
+          if (!m) return new Response(null, { status: 416, headers: h });
+          let start = m[1] ? Number(m[1]) : 0, end = m[2] ? Number(m[2]) : meta.size - 1;
+          if (!m[1] && m[2]) { const suffix = Number(m[2]); start = Math.max(0, meta.size - suffix); end = meta.size - 1; }
+          if (start > end || start >= meta.size) { h.set("Content-Range", `bytes */${meta.size}`); return new Response(null, { status: 416, headers: h }); }
+          end = Math.min(end, meta.size - 1); obj = await env.AUDIO.get(s.audio_key, { range: { offset: start, length: end - start + 1 } });
+          h.set("Content-Range", `bytes ${start}-${end}/${meta.size}`); h.set("Content-Length", String(end - start + 1)); status = 206;
+        } else { obj = await env.AUDIO.get(s.audio_key); h.set("Content-Length", String(meta.size)); }
+        if (!obj) return new Response("Not found", { status: 404, headers: h });
+        if (obj.httpMetadata?.contentType) h.set("Content-Type", obj.httpMetadata.contentType);
+        return new Response(obj.body, { status, headers: h });
+      }
+      if (p.startsWith("/api/cover/") && method === "GET") {
+        const sid = p.split("/").pop(), s = await env.DB.prepare("SELECT cover_key FROM songs WHERE id=? AND published=1").bind(sid).first();
+        if (!s?.cover_key) return new Response("Not found", { status: 404, headers });
+        const o = await env.AUDIO.get(s.cover_key); if (!o) return new Response("Not found", { status: 404, headers });
+        return new Response(o.body, { headers: { ...Object.fromEntries(headers), "Content-Type": o.httpMetadata?.contentType || "image/jpeg", "Cache-Control": "public, max-age=3600" } });
+      }
+
+      if (p === "/api/admin/songs" && method === "POST") {
+        if (!isAdmin(u)) return json({ error: "فقط مدیر اجازه انتشار دارد" }, 403, headers);
+        const form = await req.formData(), audioFile = form.get("audio"), cover = form.get("cover");
+        if (!(audioFile instanceof File) || !audioExt.test(audioFile.name)) return json({ error: "فرمت فایل صوتی پشتیبانی نمی‌شود" }, 400, headers);
+        bytesAllowed(audioFile, 80 * 1024 * 1024, "صوتی");
+        if (cover instanceof File) { bytesAllowed(cover, 5 * 1024 * 1024, "کاور"); if (!imageTypes.has(cover.type)) return json({ error: "کاور باید JPG، PNG یا WebP باشد" }, 400, headers); }
+        const sid = id(), ak = `admin/audio/${sid}`, ck = cover instanceof File ? `admin/covers/${sid}` : null;
+        await env.AUDIO.put(ak, audioFile.stream(), { httpMetadata: { contentType: audioFile.type || "audio/mpeg" } });
+        try {
+          if (ck) await env.AUDIO.put(ck, cover.stream(), { httpMetadata: { contentType: cover.type } });
+          await env.DB.prepare("INSERT INTO songs(id,title,artist,genre,description,audio_key,cover_key,mime_type,uploaded_by,published,created_at) VALUES(?,?,?,?,?,?,?,?,?,1,?)")
+            .bind(sid, String(form.get("title") || "بدون عنوان").slice(0,120), String(form.get("artist") || "ناشناس").slice(0,120), String(form.get("genre") || "سایر"), String(form.get("description") || "").slice(0,500), ak, ck, audioFile.type || "audio/mpeg", u.id, Date.now()).run();
+        } catch (e) { await env.AUDIO.delete(ak); if (ck) await env.AUDIO.delete(ck); throw e; }
+        return json({ ok: true, id: sid }, 201, headers);
+      }
+
+      // Community submissions: 2 attempts per rolling 24 hours; each user has an isolated R2 prefix and quota.
+      if (p === "/api/submissions" && method === "POST") {
+        if (!u) return json({ error: "برای ارسال آهنگ ابتدا وارد حساب شو" }, 401, headers);
+        const form = await req.formData(), audioFile = form.get("audio"), cover = form.get("cover");
+        if (!(audioFile instanceof File) || !audioExt.test(audioFile.name)) return json({ error: "فقط MP3، M4A، AAC، OGG، WAV، FLAC یا WebM مجاز است" }, 400, headers);
+        bytesAllowed(audioFile, 25 * 1024 * 1024, "صوتی");
+        if (cover instanceof File) { bytesAllowed(cover, 3 * 1024 * 1024, "کاور"); if (!imageTypes.has(cover.type)) return json({ error: "کاور باید JPG، PNG یا WebP باشد" }, 400, headers); }
+        const totalBytes = audioFile.size + (cover instanceof File ? cover.size : 0);
+        const sid = id(), now = Date.now(), ak = `community/${u.id}/${sid}/audio`, ck = cover instanceof File ? `community/${u.id}/${sid}/cover` : null;
+        const title = String(form.get("title") || "").trim().slice(0,120), artist = String(form.get("artist") || "").trim().slice(0,120);
+        if (!title || !artist) return json({ error: "عنوان آهنگ و نام هنرمند لازم است" }, 400, headers);
+        const reservation = await env.DB.prepare(
+          `INSERT INTO submissions(id,user_id,title,artist,genre,description,audio_key,cover_key,mime_type,storage_bytes,status,submitted_at)
+           SELECT ?,?,?,?,?,?,?,?,?,?,'pending',?
+           WHERE (SELECT COUNT(*) FROM submissions WHERE user_id=? AND submitted_at>?) < 2
+             AND (SELECT COALESCE(SUM(storage_bytes),0) FROM submissions WHERE user_id=? AND status IN ('pending','approved')) + ? <= ?`
+        ).bind(sid,u.id,title,artist,String(form.get("genre")||"سایر"),String(form.get("description")||"").slice(0,500),ak,ck,audioFile.type||"audio/mpeg",totalBytes,now,u.id,now-86400000,u.id,totalBytes,quotaBytes(env)).run();
+        if (!reservation.meta?.changes) {
+          const q = await userQuota(env, u.id);
+          if (q.remainingUploads <= 0) return json({ error: "سهمیه ارسال تمام شده؛ در هر ۲۴ ساعت فقط ۲ آهنگ می‌توانی بفرستی", quota: q }, 429, headers);
+          return json({ error: `فضای ابری حساب کافی نیست؛ فضای آزاد: ${q.remainingBytes} بایت`, quota: q }, 413, headers);
+        }
+        try {
+          await env.AUDIO.put(ak, audioFile.stream(), { httpMetadata: { contentType: audioFile.type || "audio/mpeg" } });
+          if (ck) await env.AUDIO.put(ck, cover.stream(), { httpMetadata: { contentType: cover.type } });
+        } catch (e) {
+          await env.DB.prepare("DELETE FROM submissions WHERE id=?").bind(sid).run();
+          await removeSubmissionObjects(env, { audio_key: ak, cover_key: ck });
+          throw e;
+        }
+        return json({ ok: true, id: sid, status: "pending", quota: await userQuota(env, u.id) }, 201, headers);
+      }
+      if (p === "/api/submissions" && method === "GET") {
+        if (!u) return json({ error: "ابتدا وارد حساب شو" }, 401, headers);
+        const { results } = await env.DB.prepare("SELECT id,title,artist,genre,status,submitted_at,reviewed_at,reject_reason,storage_bytes FROM submissions WHERE user_id=? ORDER BY submitted_at DESC LIMIT 50").bind(u.id).all();
+        return json({ submissions: results, quota: await userQuota(env, u.id) }, 200, headers);
+      }
+      if (p === "/api/admin/submissions" && method === "GET") {
+        if (!isAdmin(u)) return json({ error: "دسترسی مدیر لازم است" }, 403, headers);
+        const statusFilter = url.searchParams.get("status") || "pending";
+        const { results } = await env.DB.prepare(
+          "SELECT s.id,s.title,s.artist,s.genre,s.description,s.storage_bytes,s.submitted_at,u.name AS user_name FROM submissions s JOIN users u ON u.id=s.user_id WHERE s.status=? ORDER BY s.submitted_at ASC LIMIT 100"
+        ).bind(statusFilter).all();
+        return json({ submissions: results }, 200, headers);
+      }
+      const approveMatch = p.match(/^\/api\/admin\/submissions\/([^/]+)\/approve$/);
+      if (approveMatch && method === "POST") {
+        if (!isAdmin(u)) return json({ error: "دسترسی مدیر لازم است" }, 403, headers);
+        const sid = decodeURIComponent(approveMatch[1]), now = Date.now();
+        await env.DB.batch([
+          env.DB.prepare(
+            `INSERT OR IGNORE INTO songs(id,title,artist,genre,description,audio_key,cover_key,mime_type,uploaded_by,published,created_at)
+             SELECT id,title,artist,genre,description,audio_key,cover_key,mime_type,user_id,1,? FROM submissions WHERE id=? AND status='pending'`
+          ).bind(now, sid),
+          env.DB.prepare("UPDATE submissions SET status='approved',reviewed_at=? WHERE id=? AND status='pending'").bind(now, sid)
+        ]);
+        const row = await env.DB.prepare("SELECT status FROM submissions WHERE id=?").bind(sid).first();
+        if (!row || row.status !== "approved") return json({ error: "این ارسال پیدا نشد یا قبلاً بررسی شده است" }, 404, headers);
+        return json({ ok: true, status: "approved" }, 200, headers);
+      }
+      const rejectMatch = p.match(/^\/api\/admin\/submissions\/([^/]+)\/reject$/);
+      if (rejectMatch && method === "POST") {
+        if (!isAdmin(u)) return json({ error: "دسترسی مدیر لازم است" }, 403, headers);
+        const sid = decodeURIComponent(rejectMatch[1]), b = await body(req), reason = String(b.reason || "با معیارهای انتشار مطابقت نداشت").slice(0,500);
+        const row = await env.DB.prepare("SELECT * FROM submissions WHERE id=? AND status='pending'").bind(sid).first();
+        if (!row) return json({ error: "این ارسال پیدا نشد یا قبلاً بررسی شده است" }, 404, headers);
+        const upd = await env.DB.prepare("UPDATE submissions SET status='rejected',reviewed_at=?,reject_reason=?,storage_bytes=0,audio_key=NULL,cover_key=NULL WHERE id=? AND status='pending'")
+          .bind(Date.now(), reason, sid).run();
+        if (!upd.meta?.changes) return json({ error: "این ارسال هم‌زمان بررسی شده است" }, 409, headers);
+        await removeSubmissionObjects(env, row);
+        return json({ ok: true, status: "rejected" }, 200, headers);
+      }
+      // Admin-only preview of pending uploads. This is streaming, not a public download endpoint.
+      const previewMatch = p.match(/^\/api\/submission-preview\/([^/]+)$/);
+      if (previewMatch && method === "GET") {
+        if (!isAdmin(u)) return json({ error: "دسترسی مدیر لازم است" }, 403, headers);
+        const sid = decodeURIComponent(previewMatch[1]);
+        const row = await env.DB.prepare("SELECT audio_key,mime_type FROM submissions WHERE id=? AND status='pending'").bind(sid).first();
+        if (!row?.audio_key) return new Response("Not found", { status: 404, headers });
+        const meta = await env.AUDIO.head(row.audio_key); if (!meta) return new Response("Not found", { status: 404, headers });
+        const range = req.headers.get("Range"); let obj, status = 200;
+        const h = new Headers(headers); h.set("Content-Type", row.mime_type || "audio/mpeg"); h.set("Cache-Control", "private, no-store"); h.set("Accept-Ranges", "bytes"); h.set("Content-Disposition", "inline");
+        if (range) {
+          const m = range.match(/bytes=(\d*)-(\d*)/);
+          if (!m) return new Response(null, { status: 416, headers: h });
+          let start = m[1] ? Number(m[1]) : 0, end = m[2] ? Number(m[2]) : meta.size - 1;
+          if (!m[1] && m[2]) { start = Math.max(0, meta.size - Number(m[2])); end = meta.size - 1; }
+          if (start > end || start >= meta.size) { h.set("Content-Range", `bytes */${meta.size}`); return new Response(null, { status: 416, headers: h }); }
+          end = Math.min(end, meta.size - 1); obj = await env.AUDIO.get(row.audio_key, { range: { offset: start, length: end - start + 1 } });
+          h.set("Content-Range", `bytes ${start}-${end}/${meta.size}`); h.set("Content-Length", String(end - start + 1)); status = 206;
+        } else { obj = await env.AUDIO.get(row.audio_key); h.set("Content-Length", String(meta.size)); }
+        if (!obj) return new Response("Not found", { status: 404, headers: h });
+        return new Response(obj.body, { status, headers: h });
+      }
+
+      if (p === "/api/favorites" && method === "GET") {
+        if (!u) return json({ error: "ابتدا وارد حساب شو" }, 401, headers);
+        const { results } = await env.DB.prepare("SELECT s.id,s.title,s.artist,s.genre,s.cover_key FROM favorites f JOIN songs s ON s.id=f.song_id WHERE f.user_id=? AND s.published=1 ORDER BY f.created_at DESC").bind(u.id).all();
+        return json({ songs: results.map(s => ({ ...s, coverUrl: s.cover_key ? `${url.origin}/api/cover/${encodeURIComponent(s.id)}` : null })) }, 200, headers);
+      }
+      if (p === "/api/favorites" && method === "POST") {
+        if (!u) return json({ error: "ابتدا وارد حساب شو" }, 401, headers);
+        const b = await body(req), sid = String(b.songId || "");
+        const old = await env.DB.prepare("SELECT 1 FROM favorites WHERE user_id=? AND song_id=?").bind(u.id, sid).first();
+        if (old) { await env.DB.prepare("DELETE FROM favorites WHERE user_id=? AND song_id=?").bind(u.id, sid).run(); return json({ saved: false }, 200, headers); }
+        await env.DB.prepare("INSERT OR IGNORE INTO favorites(user_id,song_id,created_at) VALUES(?,?,?)").bind(u.id, sid, Date.now()).run();
+        return json({ saved: true }, 200, headers);
+      }
+      if (p === "/api/comments" && method === "GET") {
+        const sid = url.searchParams.get("songId"), { results } = await env.DB.prepare("SELECT c.id,c.body,c.created_at,u.name FROM comments c JOIN users u ON u.id=c.user_id WHERE c.song_id=? ORDER BY c.created_at DESC LIMIT 100").bind(sid).all();
+        return json({ comments: results }, 200, headers);
+      }
+      if (p === "/api/comments" && method === "POST") {
+        if (!u) return json({ error: "برای نظر دادن وارد حساب شو" }, 401, headers);
+        const b = await body(req), txt = String(b.body || "").trim();
+        if (!txt || txt.length > 1200) return json({ error: "متن دیدگاه نامعتبر است" }, 400, headers);
+        await env.DB.prepare("INSERT INTO comments(id,song_id,user_id,body,created_at) VALUES(?,?,?,?,?)").bind(id(), String(b.songId), u.id, txt, Date.now()).run();
+        return json({ ok: true }, 201, headers);
+      }
+      if (p === "/api/tickets" && method === "POST") {
+        if (!u) return json({ error: "برای ارسال تیکت وارد حساب شو" }, 401, headers);
+        const b = await body(req), sub = String(b.subject || "").trim(), txt = String(b.body || "").trim();
+        if (!sub || !txt || sub.length > 160 || txt.length > 3000) return json({ error: "موضوع و متن تیکت لازم است" }, 400, headers);
+        await env.DB.prepare("INSERT INTO tickets(id,user_id,subject,body,status,created_at) VALUES(?,?,?,?,?,?)").bind(id(), u.id, sub, txt, "در انتظار پاسخ", Date.now()).run();
+        return json({ ok: true }, 201, headers);
+      }
+      if (p === "/api/tickets" && method === "GET") {
+        if (!u) return json({ error: "ابتدا وارد حساب شو" }, 401, headers);
+        const q = isAdmin(u) ? "SELECT t.*,u.name FROM tickets t JOIN users u ON u.id=t.user_id ORDER BY t.created_at DESC" : "SELECT * FROM tickets WHERE user_id=? ORDER BY created_at DESC";
+        const { results } = isAdmin(u) ? await env.DB.prepare(q).all() : await env.DB.prepare(q).bind(u.id).all();
+        return json({ tickets: results }, 200, headers);
+      }
+      if (p === "/api/rooms" && method === "POST") {
+        if (!u) return json({ error: "برای ساخت اتاق وارد حساب شو" }, 401, headers);
+        const b = await body(req), code = "DV-" + crypto.randomUUID().slice(0,5).toUpperCase();
+        const room = env.ROOMS.get(env.ROOMS.idFromName(code));
+        await room.fetch("https://room/create", { method: "POST", body: JSON.stringify({ songId: b.songId || null, owner: u.id }) });
+        return json({ code }, 201, headers);
+      }
+      const roomMatch = p.match(/^\/api\/rooms\/([^/]+)\/connect$/);
+      if (roomMatch && method === "GET") {
+        const room = env.ROOMS.get(env.ROOMS.idFromName(decodeURIComponent(roomMatch[1])));
+        return room.fetch(req);
+      }
+      return json({ error: "مسیر پیدا نشد" }, 404, headers);
+    } catch (e) {
+      console.error("Dark Valley API error:", e);
+      return json({ error: "خطای داخلی سرور رخ داد", requestId: crypto.randomUUID() }, 500, headers);
+    }
+  }
+};
+// Durable Object for synchronized listening rooms.
+export class Room {
+  constructor(state, env) { this.state = state; this.env = env; this.peers = new Set(); this.data = { songId: null, playing: false, time: 0 }; this.ready = this.state.storage.get("data").then(v => { if (v) this.data = v; }); }
+  async fetch(req) {
+    await this.ready; const u = new URL(req.url);
+    if (u.pathname === "/create") { this.data = await req.json(); await this.state.storage.put("data", this.data); return new Response("ok"); }
+    if (u.pathname === "/connect") {
+      if (req.headers.get("Upgrade") !== "websocket") return new Response("WebSocket required", { status: 426 });
+      const pair = new WebSocketPair(), client = pair[0], server = pair[1]; server.accept(); this.peers.add(server);
+      server.send(JSON.stringify({ type: "state", ...this.data }));
+      server.addEventListener("message", async e => {
+        let m; try { m = JSON.parse(e.data); } catch { return; }
+        if (m.type === "play") { this.data = { ...this.data, playing: true, songId: m.songId || this.data.songId, time: 0 }; }
+        if (m.type === "pause") this.data.playing = false;
+        if (m.type === "seek") this.data.time = Number(m.time) || 0;
+        await this.state.storage.put("data", this.data);
+        for (const peer of this.peers) { try { peer.send(JSON.stringify({ ...m, ...this.data })); } catch { this.peers.delete(peer); } }
+      });
+      server.addEventListener("close", () => this.peers.delete(server));
+      return new Response(null, { status: 101, webSocket: client });
+    }
+    return new Response("Not found", { status: 404 });
+  }
+}
